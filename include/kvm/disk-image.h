@@ -92,5 +92,8 @@ ssize_t raw_image__read_mmap(struct disk_image *disk, u64 sector,
 ssize_t raw_image__write_mmap(struct disk_image *disk, u64 sector,
 				const struct iovec *iov, int iovcount, void *param);
 int raw_image__close(struct disk_image *disk);
+
+struct disk_image *swap_image__probe(int fd, struct stat *st, bool readonly);
+
 void disk_image__set_callback(struct disk_image *disk, void (*disk_req_cb)(void *param, long len));
 #endif /* KVM__DISK_IMAGE_H */

@@ -70,6 +70,7 @@ OBJS	+= virtio/pci.o
 OBJS	+= disk/blk.o
 OBJS	+= disk/qcow.o
 OBJS	+= disk/raw.o
+OBJS	+= disk/swap.o
 OBJS	+= ioeventfd.o
 OBJS	+= net/uip/core.o
 OBJS	+= net/uip/arp.o
@@ -309,16 +310,16 @@ ifeq ($(call try-build,$(SOURCE_HELLO),$(CFLAGS),-no-pie),y)
 	PIE_FLAGS	+= -no-pie
 endif
 
-ifneq ($(NOTFOUND),)
-        $(warning Skipping optional libraries: $(NOTFOUND))
-endif
+###ifneq ($(NOTFOUND),)
+###        $(warning Skipping optional libraries: $(NOTFOUND))
+###endif
 
 ###
 
 LIBS	+= -lrt
 LIBS	+= -lpthread
 LIBS	+= -lutil
-
+LIBS    += -L/home/jacob/dev/oneroot/build -lswap -lb2 -lpthread -llz4 -luuid -lcurl
 
 comma = ,
 
@@ -333,7 +334,7 @@ DEFINES	+= -D_GNU_SOURCE
 DEFINES	+= -DKVMTOOLS_VERSION='"$(KVMTOOLS_VERSION)"'
 DEFINES	+= -DBUILD_ARCH='"$(ARCH)"'
 
-KVM_INCLUDE := include
+KVM_INCLUDE := include -I/home/jacob/dev/oneroot
 CFLAGS	+= $(CPPFLAGS) $(DEFINES) -I$(KVM_INCLUDE) -I$(ARCH_INCLUDE) -O2 -fno-strict-aliasing -g
 
 WARNINGS += -Wall
@@ -382,6 +383,9 @@ $(PROGRAM)-static:  $(STATIC_OBJS) $(OTHEROBJS) $(GUEST_OBJS)
 $(PROGRAM): $(OBJS) $(OBJS_DYNOPT) $(OTHEROBJS) $(GUEST_OBJS)
 	$(E) "  LINK    " $@
 	$(Q) $(CC) $(CFLAGS) $(OBJS) $(OBJS_DYNOPT) $(OTHEROBJS) $(GUEST_OBJS) $(LDFLAGS) $(LIBS) $(LIBS_DYNOPT) -o $@
+
+	#$(Q) $(CC) $(CFLAGS) $(OBJS) $(OBJS_DYNOPT) $(OTHEROBJS) $(GUEST_OBJS) $(LDFLAGS) -fsanitize=address -fno-omit-frame-pointer $(LIBS) $(LIBS_DYNOPT) -o $@
+	
 
 $(PROGRAM_ALIAS): $(PROGRAM)
 	$(E) "  LN      " $@

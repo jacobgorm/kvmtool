@@ -153,6 +153,13 @@ static struct disk_image *disk_image__open(const char *filename, bool readonly, 
 		return disk;
 	}
 
+#if 1
+	/* swap image ?*/
+	disk = swap_image__probe(fd, &st, readonly);
+	if (!IS_ERR_OR_NULL(disk))
+		return disk;
+#endif
+
 	/* raw image ?*/
 	disk = raw_image__probe(fd, &st, readonly);
 	if (!IS_ERR_OR_NULL(disk))
