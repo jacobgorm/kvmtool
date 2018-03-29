@@ -110,16 +110,14 @@ static struct disk_image_operations swap_image_ops = {
 	.write	= swap_image__write,
 };
 
-extern void aio_wait(void);
-extern void aio_init(void);
-extern void ioh_init(void);
+extern void swap_aio_wait(void);
+extern void swap_aio_init(void);
 
 static void *disk_swap_thread(void *bs)
 {
-    ioh_init();
-    aio_init();
-    for (;;) {
+    swap_aio_init();
 
+    for (;;) {
         for (;;) {
             int start = __sync_fetch_and_add(&cons, 0) & (MAX_IOS - 1);
             int end = __sync_fetch_and_add(&prod, 0) & (MAX_IOS - 1);
@@ -138,10 +136,8 @@ static void *disk_swap_thread(void *bs)
             infos[start] = NULL;
             __sync_fetch_and_add(&cons, 1);
         }
-
-        aio_wait();
+        swap_aio_wait();
     }
-
     return NULL;
 }
 
