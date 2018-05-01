@@ -21,25 +21,31 @@ struct io_info {
     struct list_head list;
     struct disk_image *disk;
     u64 sector;
+    u64 total;
     const struct iovec *iov;
     int iovcount;
     void *param;
     int type;
+    u8 *buffer;
 };
 
 static void io_done(void *opaque, int ret)
 {
     struct io_info *info = opaque;
-    if (--(info->iovcount) == 0) {
-        struct iocb iocb;
-        struct disk_image *disk = info->disk;
-        /* fake read to trigger io callback. */
-        char dummy;
-        struct iovec iov = {&dummy, sizeof(dummy)};
-        aio_preadv(disk->ctx, &iocb, disk->fd, &iov, 1, 0,
-                disk->evt, info->param);
-        free(info);
+
+    if (info->type == 0) {
+        int offset = 0;
+        const struct iovec *iov = info->iov;
+        for (int i = 0; i < info->iovcount; ++i, ++iov) {
+            memcpy(iov->iov_base, info->buffer + offset, iov->iov_len);
+            offset += iov->iov_len;
+        }
     }
+
+    struct disk_image *disk = info->disk;
+    disk->disk_req_cb(info->param, info->total);
+    free(info->buffer);
+    free(info);
 }
 
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -57,6 +63,7 @@ ssize_t swap_image__io(struct disk_image *disk, u64 sector, const struct iovec *
     }
     info->disk = disk;
     info->sector = sector;
+    info->total = total;
     info->iov = iov;
     info->iovcount = iovcount;
     info->param = param;
@@ -68,7 +75,7 @@ ssize_t swap_image__io(struct disk_image *disk, u64 sector, const struct iovec *
 
     ioh_wakeup();
 
-    return total;
+    return 1;
 }
 
 ssize_t swap_image__read(struct disk_image *disk, u64 sector, const struct iovec *iov,
@@ -109,19 +116,21 @@ static void *disk_swap_thread(void *bs)
                 break;
             }
 
-            const struct iovec *iov = info->iov;
-            /* Contents of "info" are likely to change under us due to callbacks */
-            u64 sector = info->sector;
-            int count = info->iovcount;
-            int type = info->type;
-            for (int i = 0; i < count; ++i, ++iov) {
-                u64 n = iov->iov_len >> SECTOR_SHIFT;
-                if (type == 0) {
-                    swap_aio_read(bs, sector, iov->iov_base, n, io_done, info);
-                } else {
-                    swap_aio_write(bs, sector, iov->iov_base, n, io_done, info);
+            info->buffer = malloc(info->total);
+            if (info->type == 0) {
+                swap_aio_read(bs, info->sector, info->buffer,
+                        info->total >> SECTOR_SHIFT,
+                        io_done, info);
+            } else {
+                const struct iovec *iov = info->iov;
+                int offset = 0;
+                for (int i = 0; i < info->iovcount; ++i, ++iov) {
+                    memcpy(info->buffer + offset, iov->iov_base, iov->iov_len);
+                    offset += iov->iov_len;
                 }
-                sector += n;
+                swap_aio_write(bs, info->sector,
+                        info->buffer, info->total >> SECTOR_SHIFT,
+                        io_done, info);
             }
         }
         swap_aio_wait();
@@ -135,7 +144,9 @@ struct disk_image *swap_image__probe(int fd, struct stat *st, bool readonly)
     struct BlockDriverState *bs = calloc(1, sizeof(*bs));
     swap_open(bs, "arch.swap", 0);
 
-    disk = disk_image__new(fd, st->st_size, &swap_image_ops, DISK_IMAGE_REGULAR);
+    disk = disk_image__new(fd, bs->total_sectors << (u64) SECTOR_SHIFT,
+            &swap_image_ops, DISK_IMAGE_REGULAR);
+
 #ifdef CONFIG_HAS_AIO
     if (!IS_ERR_OR_NULL(disk))
         disk->async = 1;
