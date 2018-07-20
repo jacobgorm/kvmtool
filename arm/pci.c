@@ -1,5 +1,6 @@
 #include "kvm/devices.h"
 #include "kvm/fdt.h"
+#include "kvm/kvm.h"
 #include "kvm/of_pci.h"
 #include "kvm/pci.h"
 #include "kvm/util.h"
@@ -77,6 +78,7 @@ void pci__generate_fdt_nodes(void *fdt)
 		u8 dev_num = dev_hdr->dev_num;
 		u8 pin = pci_hdr->irq_pin;
 		u8 irq = pci_hdr->irq_line;
+		u32 irq_flags = pci_hdr->irq_type;
 
 		*entry = (struct of_interrupt_map_entry) {
 			.pci_irq_mask = {
@@ -93,7 +95,7 @@ void pci__generate_fdt_nodes(void *fdt)
 			.gic_irq = {
 				.type	= cpu_to_fdt32(GIC_FDT_IRQ_TYPE_SPI),
 				.num	= cpu_to_fdt32(irq - GIC_SPI_IRQ_BASE),
-				.flags	= cpu_to_fdt32(IRQ_TYPE_EDGE_RISING),
+				.flags	= cpu_to_fdt32(irq_flags),
 			},
 		};
 

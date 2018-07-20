@@ -59,6 +59,8 @@ OBJS	+= main.o
 OBJS	+= mmio.o
 OBJS	+= pci.o
 OBJS	+= term.o
+OBJS	+= vfio/core.o
+OBJS	+= vfio/pci.o
 OBJS	+= virtio/blk.o
 OBJS	+= virtio/scsi.o
 OBJS	+= virtio/console.o
@@ -208,7 +210,13 @@ ifeq ($(call try-build,$(SOURCE_BFD),$(CFLAGS),$(LDFLAGS) -lbfd -static),y)
 	OBJS_STATOPT	+= symbol.o
 	LIBS_STATOPT	+= -lbfd
 else
-	NOTFOUND	+= bfd
+	ifeq ($(call try-build,$(SOURCE_BFD),$(CFLAGS),$(LDFLAGS) -lbfd),y)
+		CFLAGS_DYNOPT	+= -DCONFIG_HAS_BFD
+		OBJS_DYNOPT	+= symbol.o
+		LIBS_DYNOPT	+= -lbfd
+	else
+		NOTFOUND	+= bfd
+	endif
 endif
 
 ifeq (y,$(ARCH_HAS_FRAMEBUFFER))
@@ -253,22 +261,24 @@ ifeq ($(call try-build,$(SOURCE_ZLIB),$(CFLAGS),$(LDFLAGS) -lz),y)
 	CFLAGS_DYNOPT	+= -DCONFIG_HAS_ZLIB
 	LIBS_DYNOPT	+= -lz
 else
-	NOTFOUND	+= zlib
-endif
-ifeq ($(call try-build,$(SOURCE_ZLIB),$(CFLAGS),$(LDFLAGS) -lz -static),y)
-	CFLAGS_STATOPT	+= -DCONFIG_HAS_ZLIB
-	LIBS_STATOPT	+= -lz
+	ifeq ($(call try-build,$(SOURCE_ZLIB),$(CFLAGS),$(LDFLAGS) -lz -static),y)
+		CFLAGS_STATOPT	+= -DCONFIG_HAS_ZLIB
+		LIBS_STATOPT	+= -lz
+	else
+		NOTFOUND	+= zlib
+	endif
 endif
 
 ifeq ($(call try-build,$(SOURCE_AIO),$(CFLAGS),$(LDFLAGS) -laio),y)
 	CFLAGS_DYNOPT	+= -DCONFIG_HAS_AIO
 	LIBS_DYNOPT	+= -laio
 else
-	NOTFOUND	+= aio
-endif
-ifeq ($(call try-build,$(SOURCE_AIO),$(CFLAGS),$(LDFLAGS) -laio -static),y)
-	CFLAGS_STATOPT	+= -DCONFIG_HAS_AIO
-	LIBS_STATOPT	+= -laio
+	ifeq ($(call try-build,$(SOURCE_AIO),$(CFLAGS),$(LDFLAGS) -laio -static),y)
+		CFLAGS_STATOPT	+= -DCONFIG_HAS_AIO
+		LIBS_STATOPT	+= -laio
+	else
+		NOTFOUND	+= aio
+	endif
 endif
 
 ifeq ($(LTO),1)
@@ -363,7 +373,7 @@ all: $(PROGRAM) $(PROGRAM_ALIAS)
 
 # CFLAGS used when building objects
 # This is intentionally not assigned using :=
-c_flags	= -Wp,-MD,$(depfile) $(CFLAGS)
+c_flags	= -Wp,-MD,$(depfile) -Wp,-MT,$@ $(CFLAGS)
 
 # When building -static all objects are built with appropriate flags, which
 # may differ between static & dynamic .o.  The objects are separated into
