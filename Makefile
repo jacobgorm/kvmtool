@@ -333,7 +333,7 @@ endif
 LIBS	+= -lrt
 LIBS	+= -lpthread
 LIBS	+= -lutil
-LIBS    += -L/home/jacob/dev/oneroot/build -lswap -lb2 -lpthread -llz4 -luuid -lcurl
+LIBS    += -L/home/jacob/dev/oneroot/build -lswap -lb2 -lpthread -llz4 -luuid -lcurl -lcrypto
 
 comma = ,
 
