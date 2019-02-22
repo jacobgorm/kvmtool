@@ -131,7 +131,7 @@ static int uip_dhcp_fill_option(struct uip_info *info, struct uip_dhcp *dhcp, in
 	opt[i++]	= UIP_DHCP_TAG_ROOT;
 	opt[i++]	= strlen(EMPTY_ADDR);
 	addr		= (u32 *)&opt[i];
-	strncpy((void *) addr, EMPTY_ADDR, strlen(EMPTY_ADDR));
+	strcpy((void *) addr, EMPTY_ADDR);
 	i		+= strlen(EMPTY_ADDR);
 
 	i 		= uip_dhcp_fill_option_name_and_server(info, opt, i);
@@ -199,4 +199,10 @@ int uip_tx_do_ipv4_udp_dhcp(struct uip_tx_arg *arg)
 	uip_buf_set_used(info, buf);
 
 	return 0;
+}
+
+void uip_dhcp_exit(struct uip_info *info)
+{
+	free(info->domain_name);
+	info->domain_name = NULL;
 }

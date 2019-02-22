@@ -7,6 +7,7 @@
 #include <linux/virtio_pci.h>
 
 #include <linux/types.h>
+#include <linux/virtio_config.h>
 #include <sys/uio.h>
 
 #include "kvm/barrier.h"
@@ -27,6 +28,20 @@
 #define VIRTIO_ENDIAN_HOST VIRTIO_ENDIAN_BE
 #endif
 
+/* Reserved status bits */
+#define VIRTIO_CONFIG_S_MASK \
+	(VIRTIO_CONFIG_S_ACKNOWLEDGE |	\
+	 VIRTIO_CONFIG_S_DRIVER |	\
+	 VIRTIO_CONFIG_S_DRIVER_OK |	\
+	 VIRTIO_CONFIG_S_FEATURES_OK |	\
+	 VIRTIO_CONFIG_S_FAILED)
+
+/* Kvmtool status bits */
+/* Start the device */
+#define VIRTIO__STATUS_START		(1 << 8)
+/* Stop the device */
+#define VIRTIO__STATUS_STOP		(1 << 9)
+
 struct virt_queue {
 	struct vring	vring;
 	u32		pfn;
@@ -36,6 +51,7 @@ struct virt_queue {
 	u16		last_used_signalled;
 	u16		endian;
 	bool		use_event_idx;
+	bool		enabled;
 };
 
 /*
@@ -124,8 +140,15 @@ static inline bool virt_queue__available(struct virt_queue *vq)
 	if (!vq->vring.avail)
 		return 0;
 
-	if (vq->use_event_idx)
+	if (vq->use_event_idx) {
 		vring_avail_event(&vq->vring) = last_avail_idx;
+		/*
+		 * After the driver writes a new avail index, it reads the event
+		 * index to see if we need any notification. Ensure that it
+		 * reads the updated index, or else we'll miss the notification.
+		 */
+		mb();
+	}
 
 	return vq->vring.avail->idx != last_avail_idx;
 }
@@ -155,26 +178,30 @@ struct virtio_device {
 	struct virtio_ops	*ops;
 	u16			endian;
 	u32			features;
+	u32			status;
 };
 
 struct virtio_ops {
 	u8 *(*get_config)(struct kvm *kvm, void *dev);
 	u32 (*get_host_features)(struct kvm *kvm, void *dev);
 	void (*set_guest_features)(struct kvm *kvm, void *dev, u32 features);
+	int (*get_vq_count)(struct kvm *kvm, void *dev);
 	int (*init_vq)(struct kvm *kvm, void *dev, u32 vq, u32 page_size,
 		       u32 align, u32 pfn);
+	void (*exit_vq)(struct kvm *kvm, void *dev, u32 vq);
 	int (*notify_vq)(struct kvm *kvm, void *dev, u32 vq);
-	int (*get_pfn_vq)(struct kvm *kvm, void *dev, u32 vq);
+	struct virt_queue *(*get_vq)(struct kvm *kvm, void *dev, u32 vq);
 	int (*get_size_vq)(struct kvm *kvm, void *dev, u32 vq);
 	int (*set_size_vq)(struct kvm *kvm, void *dev, u32 vq, int size);
 	void (*notify_vq_gsi)(struct kvm *kvm, void *dev, u32 vq, u32 gsi);
 	void (*notify_vq_eventfd)(struct kvm *kvm, void *dev, u32 vq, u32 efd);
 	int (*signal_vq)(struct kvm *kvm, struct virtio_device *vdev, u32 queueid);
 	int (*signal_config)(struct kvm *kvm, struct virtio_device *vdev);
-	void (*notify_status)(struct kvm *kvm, void *dev, u8 status);
+	void (*notify_status)(struct kvm *kvm, void *dev, u32 status);
 	int (*init)(struct kvm *kvm, void *dev, struct virtio_device *vdev,
 		    int device_id, int subsys_id, int class);
 	int (*exit)(struct kvm *kvm, struct virtio_device *vdev);
+	int (*reset)(struct kvm *kvm, struct virtio_device *vdev);
 };
 
 int virtio_init(struct kvm *kvm, void *dev, struct virtio_device *vdev,
@@ -193,9 +220,14 @@ static inline void virtio_init_device_vq(struct virtio_device *vdev,
 {
 	vq->endian = vdev->endian;
 	vq->use_event_idx = (vdev->features & VIRTIO_RING_F_EVENT_IDX);
+	vq->enabled = true;
 }
 
+void virtio_exit_vq(struct kvm *kvm, struct virtio_device *vdev, void *dev,
+		    int num);
 void virtio_set_guest_features(struct kvm *kvm, struct virtio_device *vdev,
 			       void *dev, u32 features);
+void virtio_notify_status(struct kvm *kvm, struct virtio_device *vdev,
+			  void *dev, u8 status);
 
 #endif /* KVM__VIRTIO_H */

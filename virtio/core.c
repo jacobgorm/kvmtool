@@ -166,6 +166,16 @@ u16 virt_queue__get_inout_iov(struct kvm *kvm, struct virt_queue *queue,
 	return head;
 }
 
+void virtio_exit_vq(struct kvm *kvm, struct virtio_device *vdev,
+			   void *dev, int num)
+{
+	struct virt_queue *vq = vdev->ops->get_vq(kvm, dev, num);
+
+	if (vq->enabled && vdev->ops->exit_vq)
+		vdev->ops->exit_vq(kvm, dev, num);
+	memset(vq, 0, sizeof(*vq));
+}
+
 int virtio__get_dev_specific_field(int offset, bool msix, u32 *config_off)
 {
 	if (msix) {
@@ -214,6 +224,36 @@ void virtio_set_guest_features(struct kvm *kvm, struct virtio_device *vdev,
 	vdev->ops->set_guest_features(kvm, dev, features);
 }
 
+void virtio_notify_status(struct kvm *kvm, struct virtio_device *vdev,
+			  void *dev, u8 status)
+{
+	u32 ext_status = status;
+
+	vdev->status &= ~VIRTIO_CONFIG_S_MASK;
+	vdev->status |= status;
+
+	/* Add a few hints to help devices */
+	if ((status & VIRTIO_CONFIG_S_DRIVER_OK) &&
+	    !(vdev->status & VIRTIO__STATUS_START)) {
+		vdev->status |= VIRTIO__STATUS_START;
+		ext_status |= VIRTIO__STATUS_START;
+
+	} else if (!status && (vdev->status & VIRTIO__STATUS_START)) {
+		vdev->status &= ~VIRTIO__STATUS_START;
+		ext_status |= VIRTIO__STATUS_STOP;
+
+		/*
+		 * Reset virtqueues and stop all traffic now, so that the device
+		 * can safely reset the backend in notify_status().
+		 */
+		if (ext_status & VIRTIO__STATUS_STOP)
+			vdev->ops->reset(kvm, vdev);
+	}
+
+	if (vdev->ops->notify_status)
+		vdev->ops->notify_status(kvm, dev, ext_status);
+}
+
 int virtio_init(struct kvm *kvm, void *dev, struct virtio_device *vdev,
 		struct virtio_ops *ops, enum virtio_trans trans,
 		int device_id, int subsys_id, int class)
@@ -231,6 +271,7 @@ int virtio_init(struct kvm *kvm, void *dev, struct virtio_device *vdev,
 		vdev->ops->signal_config	= virtio_pci__signal_config;
 		vdev->ops->init			= virtio_pci__init;
 		vdev->ops->exit			= virtio_pci__exit;
+		vdev->ops->reset		= virtio_pci__reset;
 		vdev->ops->init(kvm, dev, vdev, device_id, subsys_id, class);
 		break;
 	case VIRTIO_MMIO:
@@ -243,6 +284,7 @@ int virtio_init(struct kvm *kvm, void *dev, struct virtio_device *vdev,
 		vdev->ops->signal_config	= virtio_mmio_signal_config;
 		vdev->ops->init			= virtio_mmio_init;
 		vdev->ops->exit			= virtio_mmio_exit;
+		vdev->ops->reset		= virtio_mmio_reset;
 		vdev->ops->init(kvm, dev, vdev, device_id, subsys_id, class);
 		break;
 	default:

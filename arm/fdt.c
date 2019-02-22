@@ -14,16 +14,6 @@
 #include <linux/sizes.h>
 #include <linux/psci.h>
 
-bool kvm__load_firmware(struct kvm *kvm, const char *firmware_filename)
-{
-	return false;
-}
-
-int kvm__arch_setup_firmware(struct kvm *kvm)
-{
-	return 0;
-}
-
 static void dump_fdt(const char *dtb_file, void *fdt)
 {
 	int count, fd;
@@ -36,7 +26,7 @@ static void dump_fdt(const char *dtb_file, void *fdt)
 	if (count < 0)
 		die_perror("Failed to dump dtb");
 
-	pr_info("Wrote %d bytes to dtb %s\n", count, dtb_file);
+	pr_debug("Wrote %d bytes to dtb %s", count, dtb_file);
 	close(fd);
 }
 
@@ -141,8 +131,18 @@ static int setup_fdt(struct kvm *kvm)
 	/* /chosen */
 	_FDT(fdt_begin_node(fdt, "chosen"));
 	_FDT(fdt_property_cell(fdt, "linux,pci-probe-only", 1));
-	_FDT(fdt_property_string(fdt, "bootargs", kvm->cfg.real_cmdline));
+
+	/* Pass on our amended command line to a Linux kernel only. */
+	if (kvm->cfg.firmware_filename) {
+		if (kvm->cfg.kernel_cmdline)
+			_FDT(fdt_property_string(fdt, "bootargs",
+						 kvm->cfg.kernel_cmdline));
+	} else
+		_FDT(fdt_property_string(fdt, "bootargs",
+					 kvm->cfg.real_cmdline));
+
 	_FDT(fdt_property_u64(fdt, "kaslr-seed", kvm->cfg.arch.kaslr_seed));
+	_FDT(fdt_property_string(fdt, "stdout-path", "serial0"));
 
 	/* Initrd */
 	if (kvm->arch.initrd_size != 0) {
@@ -207,6 +207,15 @@ static int setup_fdt(struct kvm *kvm)
 	_FDT(fdt_property_cell(fdt, "cpu_on", fns->cpu_on));
 	_FDT(fdt_property_cell(fdt, "migrate", fns->migrate));
 	_FDT(fdt_end_node(fdt));
+
+	if (fdt_stdout_path) {
+		_FDT(fdt_begin_node(fdt, "aliases"));
+		_FDT(fdt_property_string(fdt, "serial0", fdt_stdout_path));
+		_FDT(fdt_end_node(fdt));
+
+		free(fdt_stdout_path);
+		fdt_stdout_path = NULL;
+	}
 
 	/* Finalise. */
 	_FDT(fdt_end_node(fdt));

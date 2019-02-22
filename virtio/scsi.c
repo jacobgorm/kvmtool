@@ -8,6 +8,7 @@
 #include "kvm/guest_compat.h"
 #include "kvm/virtio-pci.h"
 #include "kvm/virtio.h"
+#include "kvm/strbuf.h"
 
 #include <linux/kernel.h>
 #include <linux/virtio_scsi.h>
@@ -48,6 +49,10 @@ static void set_guest_features(struct kvm *kvm, void *dev, u32 features)
 	struct scsi_dev *sdev = dev;
 
 	sdev->features = features;
+}
+
+static void notify_status(struct kvm *kvm, void *dev, u32 status)
+{
 }
 
 static int init_vq(struct kvm *kvm, void *dev, u32 vq, u32 page_size, u32 align,
@@ -146,11 +151,11 @@ static int notify_vq(struct kvm *kvm, void *dev, u32 vq)
 	return 0;
 }
 
-static int get_pfn_vq(struct kvm *kvm, void *dev, u32 vq)
+static struct virt_queue *get_vq(struct kvm *kvm, void *dev, u32 vq)
 {
 	struct scsi_dev *sdev = dev;
 
-	return sdev->vqs[vq].pfn;
+	return &sdev->vqs[vq];
 }
 
 static int get_size_vq(struct kvm *kvm, void *dev, u32 vq)
@@ -163,17 +168,24 @@ static int set_size_vq(struct kvm *kvm, void *dev, u32 vq, int size)
 	return size;
 }
 
+static int get_vq_count(struct kvm *kvm, void *dev)
+{
+	return NUM_VIRT_QUEUES;
+}
+
 static struct virtio_ops scsi_dev_virtio_ops = {
 	.get_config		= get_config,
 	.get_host_features	= get_host_features,
 	.set_guest_features	= set_guest_features,
 	.init_vq		= init_vq,
-	.get_pfn_vq		= get_pfn_vq,
+	.get_vq			= get_vq,
 	.get_size_vq		= get_size_vq,
 	.set_size_vq		= set_size_vq,
+	.notify_status		= notify_status,
 	.notify_vq		= notify_vq,
 	.notify_vq_gsi		= notify_vq_gsi,
 	.notify_vq_eventfd	= notify_vq_eventfd,
+	.get_vq_count		= get_vq_count,
 };
 
 static void virtio_scsi_vhost_init(struct kvm *kvm, struct scsi_dev *sdev)
@@ -244,7 +256,7 @@ static int virtio_scsi_init_one(struct kvm *kvm, struct disk_image *disk)
 		},
 		.kvm			= kvm,
 	};
-	strncpy((char *)&sdev->target.vhost_wwpn, disk->wwpn, sizeof(sdev->target.vhost_wwpn));
+	strlcpy((char *)&sdev->target.vhost_wwpn, disk->wwpn, sizeof(sdev->target.vhost_wwpn));
 	sdev->target.vhost_tpgt = strtol(disk->tpgt, NULL, 0);
 
 	virtio_init(kvm, sdev, &sdev->vdev, &scsi_dev_virtio_ops,

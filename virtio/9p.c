@@ -322,6 +322,7 @@ static void virtio_p9_create(struct p9_dev *p9dev,
 	struct p9_qid qid;
 	struct p9_fid *dfid;
 	char full_path[PATH_MAX];
+	char *tmp_path;
 	u32 dfid_val, flags, mode, gid;
 
 	virtio_p9_pdu_readf(pdu, "dsddd", &dfid_val,
@@ -332,7 +333,13 @@ static void virtio_p9_create(struct p9_dev *p9dev,
 		goto err_out;
 
 	size = sizeof(dfid->abs_path) - (dfid->path - dfid->abs_path);
-	ret = snprintf(dfid->path, size, "%s/%s", dfid->path, name);
+
+	tmp_path = strdup(dfid->path);
+	if (!tmp_path)
+		goto err_out;
+
+	ret = snprintf(dfid->path, size, "%s/%s", tmp_path, name);
+	free(tmp_path);
 	if (ret >= (int)size) {
 		errno = ENAMETOOLONG;
 		if (size > 0)
@@ -1382,6 +1389,18 @@ static void set_guest_features(struct kvm *kvm, void *dev, u32 features)
 	conf->tag_len = virtio_host_to_guest_u16(&p9dev->vdev, conf->tag_len);
 }
 
+static void notify_status(struct kvm *kvm, void *dev, u32 status)
+{
+	struct p9_dev *p9dev = dev;
+	struct p9_fid *pfid, *next;
+
+	if (!(status & VIRTIO__STATUS_STOP))
+		return;
+
+	rbtree_postorder_for_each_entry_safe(pfid, next, &p9dev->fids, node)
+		close_fid(p9dev, pfid->fid);
+}
+
 static int init_vq(struct kvm *kvm, void *dev, u32 vq, u32 page_size, u32 align,
 		   u32 pfn)
 {
@@ -1409,6 +1428,13 @@ static int init_vq(struct kvm *kvm, void *dev, u32 vq, u32 page_size, u32 align,
 	return 0;
 }
 
+static void exit_vq(struct kvm *kvm, void *dev, u32 vq)
+{
+	struct p9_dev *p9dev = dev;
+
+	thread_pool__cancel_job(&p9dev->jobs[vq].job_id);
+}
+
 static int notify_vq(struct kvm *kvm, void *dev, u32 vq)
 {
 	struct p9_dev *p9dev = dev;
@@ -1418,11 +1444,11 @@ static int notify_vq(struct kvm *kvm, void *dev, u32 vq)
 	return 0;
 }
 
-static int get_pfn_vq(struct kvm *kvm, void *dev, u32 vq)
+static struct virt_queue *get_vq(struct kvm *kvm, void *dev, u32 vq)
 {
 	struct p9_dev *p9dev = dev;
 
-	return p9dev->vqs[vq].pfn;
+	return &p9dev->vqs[vq];
 }
 
 static int get_size_vq(struct kvm *kvm, void *dev, u32 vq)
@@ -1436,15 +1462,23 @@ static int set_size_vq(struct kvm *kvm, void *dev, u32 vq, int size)
 	return size;
 }
 
+static int get_vq_count(struct kvm *kvm, void *dev)
+{
+	return NUM_VIRT_QUEUES;
+}
+
 struct virtio_ops p9_dev_virtio_ops = {
 	.get_config		= get_config,
 	.get_host_features	= get_host_features,
 	.set_guest_features	= set_guest_features,
 	.init_vq		= init_vq,
+	.exit_vq		= exit_vq,
+	.notify_status		= notify_status,
 	.notify_vq		= notify_vq,
-	.get_pfn_vq		= get_pfn_vq,
+	.get_vq			= get_vq,
 	.get_size_vq		= get_size_vq,
 	.set_size_vq		= set_size_vq,
+	.get_vq_count		= get_vq_count,
 };
 
 int virtio_9p_rootdir_parser(const struct option *opt, const char *arg, int unset)

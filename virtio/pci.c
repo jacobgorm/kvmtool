@@ -72,6 +72,16 @@ free_ioport_evt:
 	return r;
 }
 
+static void virtio_pci_exit_vq(struct kvm *kvm, struct virtio_device *vdev,
+			       int vq)
+{
+	struct virtio_pci *vpci = vdev->virtio;
+
+	ioeventfd__del_event(vpci->mmio_addr + VIRTIO_PCI_QUEUE_NOTIFY, vq);
+	ioeventfd__del_event(vpci->port_addr + VIRTIO_PCI_QUEUE_NOTIFY, vq);
+	virtio_exit_vq(kvm, vdev, vpci->dev, vq);
+}
+
 static inline bool virtio_pci__msix_enabled(struct virtio_pci *vpci)
 {
 	return vpci->pci_hdr.msix.ctrl & cpu_to_le16(PCI_MSIX_FLAGS_ENABLE);
@@ -113,6 +123,7 @@ static bool virtio_pci__io_in(struct ioport *ioport, struct kvm_cpu *vcpu, u16 p
 	bool ret = true;
 	struct virtio_device *vdev;
 	struct virtio_pci *vpci;
+	struct virt_queue *vq;
 	struct kvm *kvm;
 	u32 val;
 
@@ -127,8 +138,8 @@ static bool virtio_pci__io_in(struct ioport *ioport, struct kvm_cpu *vcpu, u16 p
 		ioport__write32(data, val);
 		break;
 	case VIRTIO_PCI_QUEUE_PFN:
-		val = vdev->ops->get_pfn_vq(kvm, vpci->dev, vpci->queue_selector);
-		ioport__write32(data, val);
+		vq = vdev->ops->get_vq(kvm, vpci->dev, vpci->queue_selector);
+		ioport__write32(data, vq->pfn);
 		break;
 	case VIRTIO_PCI_QUEUE_NUM:
 		val = vdev->ops->get_size_vq(kvm, vpci->dev, vpci->queue_selector);
@@ -269,10 +280,15 @@ static bool virtio_pci__io_out(struct ioport *ioport, struct kvm_cpu *vcpu, u16 
 		break;
 	case VIRTIO_PCI_QUEUE_PFN:
 		val = ioport__read32(data);
-		virtio_pci__init_ioeventfd(kvm, vdev, vpci->queue_selector);
-		vdev->ops->init_vq(kvm, vpci->dev, vpci->queue_selector,
-				   1 << VIRTIO_PCI_QUEUE_ADDR_SHIFT,
-				   VIRTIO_PCI_VRING_ALIGN, val);
+		if (val) {
+			virtio_pci__init_ioeventfd(kvm, vdev,
+						   vpci->queue_selector);
+			vdev->ops->init_vq(kvm, vpci->dev, vpci->queue_selector,
+					   1 << VIRTIO_PCI_QUEUE_ADDR_SHIFT,
+					   VIRTIO_PCI_VRING_ALIGN, val);
+		} else {
+			virtio_pci_exit_vq(kvm, vdev, vpci->queue_selector);
+		}
 		break;
 	case VIRTIO_PCI_QUEUE_SEL:
 		vpci->queue_selector = ioport__read16(data);
@@ -285,8 +301,7 @@ static bool virtio_pci__io_out(struct ioport *ioport, struct kvm_cpu *vcpu, u16 
 		vpci->status = ioport__read8(data);
 		if (!vpci->status) /* Sample endianness on reset */
 			vdev->endian = kvm_cpu__get_endianness(vcpu);
-		if (vdev->ops->notify_status)
-			vdev->ops->notify_status(kvm, vpci->dev, vpci->status);
+		virtio_notify_status(kvm, vdev, vpci->dev, vpci->status);
 		break;
 	default:
 		ret = virtio_pci__specific_io_out(kvm, vdev, port, data, size, offset);
@@ -507,19 +522,25 @@ free_ioport:
 	return r;
 }
 
+int virtio_pci__reset(struct kvm *kvm, struct virtio_device *vdev)
+{
+	int vq;
+	struct virtio_pci *vpci = vdev->virtio;
+
+	for (vq = 0; vq < vdev->ops->get_vq_count(kvm, vpci->dev); vq++)
+		virtio_pci_exit_vq(kvm, vdev, vq);
+
+	return 0;
+}
+
 int virtio_pci__exit(struct kvm *kvm, struct virtio_device *vdev)
 {
 	struct virtio_pci *vpci = vdev->virtio;
-	int i;
 
+	virtio_pci__reset(kvm, vdev);
 	kvm__deregister_mmio(kvm, vpci->mmio_addr);
 	kvm__deregister_mmio(kvm, vpci->msix_io_block);
 	ioport__unregister(kvm, vpci->port_addr);
-
-	for (i = 0; i < VIRTIO_PCI_MAX_VQ; i++) {
-		ioeventfd__del_event(vpci->port_addr + VIRTIO_PCI_QUEUE_NOTIFY, i);
-		ioeventfd__del_event(vpci->mmio_addr + VIRTIO_PCI_QUEUE_NOTIFY, i);
-	}
 
 	return 0;
 }

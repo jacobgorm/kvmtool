@@ -300,7 +300,7 @@ static const char *find_kernel(void)
 			k++;
 			continue;
 		}
-		strncpy(kernel, *k, PATH_MAX);
+		strlcpy(kernel, *k, PATH_MAX);
 		return kernel;
 	}
 
@@ -414,9 +414,11 @@ static void resolve_program(const char *src, char *dst, size_t len)
 		if (!realpath(src, resolved_path))
 			die("Unable to resolve program %s: %s\n", src, strerror(errno));
 
-		snprintf(dst, len, "/host%s", resolved_path);
+		if (snprintf(dst, len, "/host%s", resolved_path) >= (int)len)
+			die("Pathname too long: %s -> %s\n", src, resolved_path);
+
 	} else
-		strncpy(dst, src, len);
+		strlcpy(dst, src, len);
 }
 
 static void kvm_run_write_sandbox_cmd(struct kvm *kvm, const char **argv, int argc)
@@ -512,12 +514,13 @@ static struct kvm *kvm_cmd_run_init(int argc, const char **argv)
 
 	kvm->nr_disks = kvm->cfg.image_count;
 
-	if (!kvm->cfg.kernel_filename)
+	if (!kvm->cfg.kernel_filename && !kvm->cfg.firmware_filename) {
 		kvm->cfg.kernel_filename = find_kernel();
 
-	if (!kvm->cfg.kernel_filename) {
-		kernel_usage_with_options();
-		return ERR_PTR(-EINVAL);
+		if (!kvm->cfg.kernel_filename) {
+			kernel_usage_with_options();
+			return ERR_PTR(-EINVAL);
+		}
 	}
 
 	kvm->cfg.vmlinux_filename = find_vmlinux();
@@ -639,10 +642,17 @@ static struct kvm *kvm_cmd_run_init(int argc, const char **argv)
 
 	kvm->cfg.real_cmdline = real_cmdline;
 
-	printf("  # %s run -k %s -m %Lu -c %d --name %s\n", KVM_BINARY_NAME,
-		kvm->cfg.kernel_filename,
-		(unsigned long long)kvm->cfg.ram_size / 1024 / 1024,
-		kvm->cfg.nrcpus, kvm->cfg.guest_name);
+	if (kvm->cfg.kernel_filename) {
+		printf("  # %s run -k %s -m %Lu -c %d --name %s\n", KVM_BINARY_NAME,
+		       kvm->cfg.kernel_filename,
+		       (unsigned long long)kvm->cfg.ram_size / 1024 / 1024,
+		       kvm->cfg.nrcpus, kvm->cfg.guest_name);
+	} else if (kvm->cfg.firmware_filename) {
+		printf("  # %s run --firmware %s -m %Lu -c %d --name %s\n", KVM_BINARY_NAME,
+		       kvm->cfg.firmware_filename,
+		       (unsigned long long)kvm->cfg.ram_size / 1024 / 1024,
+		       kvm->cfg.nrcpus, kvm->cfg.guest_name);
+	}
 
 	if (init_list__init(kvm) < 0)
 		die ("Initialisation failed");
