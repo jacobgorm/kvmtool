@@ -4,10 +4,7 @@
 #include "kvm/kvm.h"
 
 #include <linux/err.h>
-#include <sys/eventfd.h>
 #include <poll.h>
-
-#define AIO_MAX 256
 
 int debug_iodelay;
 
@@ -54,27 +51,6 @@ int disk_img_name_parser(const struct option *opt, const char *arg, int unset)
 	return 0;
 }
 
-#ifdef CONFIG_HAS_AIO
-static void *disk_image__thread(void *param)
-{
-	struct disk_image *disk = param;
-	struct io_event event[AIO_MAX];
-	struct timespec notime = {0};
-	int nr, i;
-	u64 dummy;
-
-	kvm__set_thread_name("disk-image-io");
-
-	while (read(disk->evt, &dummy, sizeof(dummy)) > 0) {
-		nr = io_getevents(disk->ctx, 1, ARRAY_SIZE(event), event, &notime);
-		for (i = 0; i < nr; i++)
-			disk->disk_req_cb(event[i].data, event[i].res);
-	}
-
-	return NULL;
-}
-#endif
-
 struct disk_image *disk_image__new(int fd, u64 size,
 				   struct disk_image_operations *ops,
 				   int use_mmap)
@@ -99,26 +75,22 @@ struct disk_image *disk_image__new(int fd, u64 size,
 		disk->priv = mmap(NULL, size, PROT_RW, MAP_PRIVATE | MAP_NORESERVE, fd, 0);
 		if (disk->priv == MAP_FAILED) {
 			r = -errno;
-			free(disk);
-			return ERR_PTR(r);
+			goto err_free_disk;
 		}
 	}
 
-#ifdef CONFIG_HAS_AIO
-	{
-		pthread_t thread;
+	r = disk_aio_setup(disk);
+	if (r)
+		goto err_unmap_disk;
 
-		disk->evt = eventfd(0, 0);
-		io_setup(AIO_MAX, &disk->ctx);
-		r = pthread_create(&thread, NULL, disk_image__thread, disk);
-		if (r) {
-			r = -errno;
-			free(disk);
-			return ERR_PTR(r);
-		}
-	}
-#endif
 	return disk;
+
+err_unmap_disk:
+	if (disk->priv)
+		munmap(disk->priv, size);
+err_free_disk:
+	free(disk);
+	return ERR_PTR(r);
 }
 
 static struct disk_image *disk_image__open(const char *filename, bool readonly, bool direct)
@@ -139,8 +111,10 @@ static struct disk_image *disk_image__open(const char *filename, bool readonly, 
 
 	/* blk device ?*/
 	disk = blkdev__probe(filename, flags, &st);
-	if (!IS_ERR_OR_NULL(disk))
+	if (!IS_ERR_OR_NULL(disk)) {
+		disk->readonly = readonly;
 		return disk;
+	}
 
 	fd = open(filename, flags);
 	if (fd < 0)
@@ -150,6 +124,7 @@ static struct disk_image *disk_image__open(const char *filename, bool readonly, 
 	disk = qcow_probe(fd, true);
 	if (!IS_ERR_OR_NULL(disk)) {
 		pr_warning("Forcing read-only support for QCOW");
+		disk->readonly = true;
 		return disk;
 	}
 
@@ -162,8 +137,10 @@ static struct disk_image *disk_image__open(const char *filename, bool readonly, 
 
 	/* raw image ?*/
 	disk = raw_image__probe(fd, &st, readonly);
-	if (!IS_ERR_OR_NULL(disk))
+	if (!IS_ERR_OR_NULL(disk)) {
+		disk->readonly = readonly;
 		return disk;
+	}
 
 	if (close(fd) < 0)
 		pr_warning("close() failed");
@@ -231,6 +208,14 @@ error:
 	return err;
 }
 
+int disk_image__wait(struct disk_image *disk)
+{
+	if (disk->ops->wait)
+		return disk->ops->wait(disk);
+
+	return 0;
+}
+
 int disk_image__flush(struct disk_image *disk)
 {
 	if (disk->ops->flush)
@@ -244,6 +229,8 @@ static int disk_image__close(struct disk_image *disk)
 	/* If there was no disk image then there's nothing to do: */
 	if (!disk)
 		return 0;
+
+	disk_aio_destroy(disk);
 
 	if (disk->ops->close)
 		return disk->ops->close(disk);

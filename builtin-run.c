@@ -31,7 +31,6 @@
 #include "kvm/sdl.h"
 #include "kvm/vnc.h"
 #include "kvm/guest_compat.h"
-#include "kvm/pci-shmem.h"
 #include "kvm/kvm-ipc.h"
 #include "kvm/builtin-debug.h"
 
@@ -99,10 +98,6 @@ void kvm_run_set_wrapper_sandbox(void)
 	OPT_INTEGER('c', "cpus", &(cfg)->nrcpus, "Number of CPUs"),	\
 	OPT_U64('m', "mem", &(cfg)->ram_size, "Virtual machine memory"	\
 		" size in MiB."),					\
-	OPT_CALLBACK('\0', "shmem", NULL,				\
-		     "[pci:]<addr>:<size>[:handle=<handle>][:create]",	\
-		     "Share host shmem with guest via pci device",	\
-		     shmem_parser, NULL),				\
 	OPT_CALLBACK('d', "disk", kvm, "image or rootfs_dir", "Disk "	\
 			" image or rootfs directory", img_name_parser,	\
 			kvm),						\
@@ -138,6 +133,8 @@ void kvm_run_set_wrapper_sandbox(void)
 			"Kernel command line arguments"),		\
 	OPT_STRING('f', "firmware", &(cfg)->firmware_filename, "firmware",\
 			"Firmware image to boot in virtual machine"),	\
+	OPT_STRING('F', "flash", &(cfg)->flash_filename, "flash",\
+			"Flash image to present to virtual machine"),	\
 									\
 	OPT_GROUP("Networking options:"),				\
 	OPT_CALLBACK_DEFAULT('n', "network", NULL, "network params",	\
@@ -546,6 +543,11 @@ static struct kvm *kvm_cmd_run_init(int argc, const char **argv)
 		kvm->cfg.console = DEFAULT_CONSOLE;
 
 	video = kvm->cfg.vnc || kvm->cfg.sdl || kvm->cfg.gtk;
+	if (video) {
+		if ((kvm->cfg.vnc && (kvm->cfg.sdl || kvm->cfg.gtk)) ||
+		    (kvm->cfg.sdl && kvm->cfg.gtk))
+			die("Only one of --vnc, --sdl or --gtk can be specified");
+	}
 
 	if (!strncmp(kvm->cfg.console, "virtio", 6))
 		kvm->cfg.active_console  = CONSOLE_VIRTIO;

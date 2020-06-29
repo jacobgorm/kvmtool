@@ -14,10 +14,6 @@
 
 /* some ports we reserve for own use */
 #define IOPORT_DBG			0xe0
-#define IOPORT_START			0x6200
-#define IOPORT_SIZE			0x400
-
-#define IOPORT_EMPTY			USHRT_MAX
 
 struct kvm;
 
@@ -26,6 +22,8 @@ struct ioport {
 	struct ioport_operations	*ops;
 	void				*priv;
 	struct device_header		dev_hdr;
+	u32				refcount;
+	bool				remove;
 };
 
 struct ioport_operations {
@@ -37,11 +35,11 @@ struct ioport_operations {
 							    enum irq_type));
 };
 
-void ioport__setup_arch(struct kvm *kvm);
+int ioport__setup_arch(struct kvm *kvm);
 void ioport__map_irq(u8 *irq);
 
-int ioport__register(struct kvm *kvm, u16 port, struct ioport_operations *ops,
-			int count, void *param);
+int __must_check ioport__register(struct kvm *kvm, u16 port, struct ioport_operations *ops,
+				  int count, void *param);
 int ioport__unregister(struct kvm *kvm, u16 port);
 int ioport__init(struct kvm *kvm);
 int ioport__exit(struct kvm *kvm);

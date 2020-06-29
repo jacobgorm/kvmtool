@@ -22,6 +22,7 @@ CC	:= $(CROSS_COMPILE)gcc
 CFLAGS	:=
 LD	:= $(CROSS_COMPILE)ld
 LDFLAGS	:=
+OBJCOPY	:= $(CROSS_COMPILE)objcopy
 
 FIND	:= find
 CSCOPE	:= cscope
@@ -99,12 +100,9 @@ OBJS	+= util/read-write.o
 OBJS	+= util/util.o
 OBJS	+= virtio/9p.o
 OBJS	+= virtio/9p-pdu.o
-OBJS	+= hw/vesa.o
-OBJS	+= hw/pci-shmem.o
 OBJS	+= kvm-ipc.o
 OBJS	+= builtin-sandbox.o
 OBJS	+= virtio/mmio.o
-OBJS	+= hw/i8042.o
 
 # Translate uname -m into ARCH string
 ARCH ?= $(shell uname -m | sed -e s/i.86/i386/ -e s/ppc.*/powerpc/ \
@@ -125,6 +123,7 @@ endif
 #x86
 ifeq ($(ARCH),x86)
 	DEFINES += -DCONFIG_X86
+	OBJS	+= hw/i8042.o
 	OBJS	+= x86/boot.o
 	OBJS	+= x86/cpuid.o
 	OBJS	+= x86/interrupt.o
@@ -172,6 +171,7 @@ ifeq ($(ARCH), arm)
 	CFLAGS		+= -march=armv7-a
 
 	ARCH_WANT_LIBFDT := y
+	ARCH_HAS_FLASH_MEM := y
 endif
 
 # ARM64
@@ -180,10 +180,12 @@ ifeq ($(ARCH), arm64)
 	OBJS		+= $(OBJS_ARM_COMMON)
 	OBJS		+= arm/aarch64/arm-cpu.o
 	OBJS		+= arm/aarch64/kvm-cpu.o
+	OBJS		+= arm/aarch64/kvm.o
 	ARCH_INCLUDE	:= $(HDRS_ARM_COMMON)
 	ARCH_INCLUDE	+= -Iarm/aarch64/include
 
 	ARCH_WANT_LIBFDT := y
+	ARCH_HAS_FLASH_MEM := y
 endif
 
 ifeq ($(ARCH),mips)
@@ -224,6 +226,8 @@ else
 endif
 
 ifeq (y,$(ARCH_HAS_FRAMEBUFFER))
+	OBJS	+= hw/vesa.o
+
 	CFLAGS_GTK3 := $(shell pkg-config --cflags gtk+-3.0 2>/dev/null)
 	LDFLAGS_GTK3 := $(shell pkg-config --libs gtk+-3.0 2>/dev/null)
 	ifeq ($(call try-build,$(SOURCE_GTK3),$(CFLAGS) $(CFLAGS_GTK3),$(LDFLAGS) $(LDFLAGS_GTK3)),y)
@@ -261,6 +265,10 @@ ifeq (y,$(ARCH_HAS_FRAMEBUFFER))
 	endif
 endif
 
+ifeq (y,$(ARCH_HAS_FLASH_MEM))
+	OBJS	+= hw/cfi_flash.o
+endif
+
 ifeq ($(call try-build,$(SOURCE_ZLIB),$(CFLAGS),$(LDFLAGS) -lz),y)
 	CFLAGS_DYNOPT	+= -DCONFIG_HAS_ZLIB
 	LIBS_DYNOPT	+= -lz
@@ -276,10 +284,12 @@ endif
 ifeq ($(call try-build,$(SOURCE_AIO),$(CFLAGS),$(LDFLAGS) -laio),y)
 	CFLAGS_DYNOPT	+= -DCONFIG_HAS_AIO
 	LIBS_DYNOPT	+= -laio
+	OBJS_DYNOPT	+= disk/aio.o
 else
 	ifeq ($(call try-build,$(SOURCE_AIO),$(CFLAGS),$(LDFLAGS) -laio -static),y)
 		CFLAGS_STATOPT	+= -DCONFIG_HAS_AIO
 		LIBS_STATOPT	+= -laio
+		OBJS_STATOPT	+= disk/aio.o
 	else
 		NOTFOUND	+= aio
 	endif
@@ -481,7 +491,7 @@ x86/bios/bios.bin.elf: x86/bios/entry.S x86/bios/e820.c x86/bios/int10.c x86/bio
 
 x86/bios/bios.bin: x86/bios/bios.bin.elf
 	$(E) "  OBJCOPY " $@
-	$(Q) objcopy -O binary -j .text x86/bios/bios.bin.elf x86/bios/bios.bin
+	$(Q) $(OBJCOPY) -O binary -j .text x86/bios/bios.bin.elf x86/bios/bios.bin
 
 x86/bios/bios-rom.o: x86/bios/bios-rom.S x86/bios/bios.bin x86/bios/bios-rom.h
 	$(E) "  CC      " $@

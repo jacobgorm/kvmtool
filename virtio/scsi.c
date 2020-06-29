@@ -72,6 +72,7 @@ static int init_vq(struct kvm *kvm, void *dev, u32 vq, u32 page_size, u32 align,
 	p		= virtio_get_vq(kvm, queue->pfn, page_size);
 
 	vring_init(&queue->vring, VIRTIO_SCSI_QUEUE_SIZE, p, align);
+	virtio_init_device_vq(&sdev->vdev, queue);
 
 	if (sdev->vhost_fd == 0)
 		return 0;
@@ -233,6 +234,7 @@ static void virtio_scsi_vhost_init(struct kvm *kvm, struct scsi_dev *sdev)
 static int virtio_scsi_init_one(struct kvm *kvm, struct disk_image *disk)
 {
 	struct scsi_dev *sdev;
+	int r;
 
 	if (!disk)
 		return -EINVAL;
@@ -259,11 +261,13 @@ static int virtio_scsi_init_one(struct kvm *kvm, struct disk_image *disk)
 	strlcpy((char *)&sdev->target.vhost_wwpn, disk->wwpn, sizeof(sdev->target.vhost_wwpn));
 	sdev->target.vhost_tpgt = strtol(disk->tpgt, NULL, 0);
 
-	virtio_init(kvm, sdev, &sdev->vdev, &scsi_dev_virtio_ops,
-		    VIRTIO_DEFAULT_TRANS(kvm), PCI_DEVICE_ID_VIRTIO_SCSI,
-		    VIRTIO_ID_SCSI, PCI_CLASS_BLK);
-
 	list_add_tail(&sdev->list, &sdevs);
+
+	r = virtio_init(kvm, sdev, &sdev->vdev, &scsi_dev_virtio_ops,
+			VIRTIO_DEFAULT_TRANS(kvm), PCI_DEVICE_ID_VIRTIO_SCSI,
+			VIRTIO_ID_SCSI, PCI_CLASS_BLK);
+	if (r < 0)
+		return r;
 
 	virtio_scsi_vhost_init(kvm, sdev);
 
@@ -301,7 +305,8 @@ int virtio_scsi_init(struct kvm *kvm)
 
 	return 0;
 cleanup:
-	return virtio_scsi_exit(kvm);
+	virtio_scsi_exit(kvm);
+	return r;
 }
 virtio_dev_init(virtio_scsi_init);
 

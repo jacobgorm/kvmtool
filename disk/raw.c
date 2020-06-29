@@ -2,38 +2,17 @@
 
 #include <linux/err.h>
 
-#ifdef CONFIG_HAS_AIO
-#include <libaio.h>
-#endif
-
-ssize_t raw_image__read(struct disk_image *disk, u64 sector, const struct iovec *iov,
+ssize_t raw_image__read_sync(struct disk_image *disk, u64 sector, const struct iovec *iov,
 				int iovcount, void *param)
 {
-	u64 offset = sector << SECTOR_SHIFT;
-
-#ifdef CONFIG_HAS_AIO
-	struct iocb iocb;
-
-	return aio_preadv(disk->ctx, &iocb, disk->fd, iov, iovcount, offset,
-				disk->evt, param);
-#else
-	return preadv_in_full(disk->fd, iov, iovcount, offset);
-#endif
+	return preadv_in_full(disk->fd, iov, iovcount, sector << SECTOR_SHIFT);
 }
 
-ssize_t raw_image__write(struct disk_image *disk, u64 sector, const struct iovec *iov,
-				int iovcount, void *param)
+ssize_t raw_image__write_sync(struct disk_image *disk, u64 sector,
+			      const struct iovec *iov, int iovcount,
+			      void *param)
 {
-	u64 offset = sector << SECTOR_SHIFT;
-
-#ifdef CONFIG_HAS_AIO
-	struct iocb iocb;
-
-	return aio_pwritev(disk->ctx, &iocb, disk->fd, iov, iovcount, offset,
-				disk->evt, param);
-#else
-	return pwritev_in_full(disk->fd, iov, iovcount, offset);
-#endif
+	return pwritev_in_full(disk->fd, iov, iovcount, sector << SECTOR_SHIFT);
 }
 
 ssize_t raw_image__read_mmap(struct disk_image *disk, u64 sector, const struct iovec *iov,
@@ -79,12 +58,6 @@ int raw_image__close(struct disk_image *disk)
 	if (disk->priv != MAP_FAILED)
 		ret = munmap(disk->priv, disk->size);
 
-	close(disk->evt);
-
-#ifdef CONFIG_HAS_VIRTIO
-	io_destroy(disk->ctx);
-#endif
-
 	return ret;
 }
 
@@ -94,6 +67,8 @@ int raw_image__close(struct disk_image *disk)
 static struct disk_image_operations raw_image_regular_ops = {
 	.read	= raw_image__read,
 	.write	= raw_image__write,
+	.wait	= raw_image__wait,
+	.async	= true,
 };
 
 struct disk_image_operations ro_ops = {
@@ -104,12 +79,12 @@ struct disk_image_operations ro_ops = {
 
 struct disk_image_operations ro_ops_nowrite = {
 	.read	= raw_image__read,
+	.wait	= raw_image__wait,
+	.async	= true,
 };
 
 struct disk_image *raw_image__probe(int fd, struct stat *st, bool readonly)
 {
-	struct disk_image *disk;
-
 	if (readonly) {
 		/*
 		 * Use mmap's MAP_PRIVATE to implement non-persistent write
@@ -120,10 +95,6 @@ struct disk_image *raw_image__probe(int fd, struct stat *st, bool readonly)
 		disk = disk_image__new(fd, st->st_size, &ro_ops, DISK_IMAGE_MMAP);
 		if (IS_ERR_OR_NULL(disk)) {
 			disk = disk_image__new(fd, st->st_size, &ro_ops_nowrite, DISK_IMAGE_REGULAR);
-#ifdef CONFIG_HAS_AIO
-			if (!IS_ERR_OR_NULL(disk))
-				disk->async = 1;
-#endif
 		}
 
 		return disk;
@@ -131,11 +102,6 @@ struct disk_image *raw_image__probe(int fd, struct stat *st, bool readonly)
 		/*
 		 * Use read/write instead of mmap
 		 */
-		disk = disk_image__new(fd, st->st_size, &raw_image_regular_ops, DISK_IMAGE_REGULAR);
-#ifdef CONFIG_HAS_AIO
-		if (!IS_ERR_OR_NULL(disk))
-			disk->async = 1;
-#endif
-		return disk;
+		return disk_image__new(fd, st->st_size, &raw_image_regular_ops, DISK_IMAGE_REGULAR);
 	}
 }

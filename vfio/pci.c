@@ -3,16 +3,25 @@
 #include "kvm/kvm-cpu.h"
 #include "kvm/vfio.h"
 
+#include <assert.h>
+
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <sys/time.h>
 
+#include <assert.h>
+
 /* Wrapper around UAPI vfio_irq_set */
-struct vfio_irq_eventfd {
+union vfio_irq_eventfd {
 	struct vfio_irq_set	irq;
-	int			fd;
+	u8 buffer[sizeof(struct vfio_irq_set) + sizeof(int)];
 };
+
+static void set_vfio_irq_eventd_payload(union vfio_irq_eventfd *evfd, int fd)
+{
+	memcpy(&evfd->irq.data, &fd, sizeof(fd));
+}
 
 #define msi_is_enabled(state)		((state) & VFIO_PCI_MSI_STATE_ENABLED)
 #define msi_is_masked(state)		((state) & VFIO_PCI_MSI_STATE_MASKED)
@@ -28,6 +37,7 @@ struct vfio_irq_eventfd {
 	msi_update_state(state, val, VFIO_PCI_MSI_STATE_EMPTY)
 
 static void vfio_pci_disable_intx(struct kvm *kvm, struct vfio_device *vdev);
+static int vfio_pci_enable_intx(struct kvm *kvm, struct vfio_device *vdev);
 
 static int vfio_pci_enable_msis(struct kvm *kvm, struct vfio_device *vdev,
 				bool msix)
@@ -37,7 +47,7 @@ static int vfio_pci_enable_msis(struct kvm *kvm, struct vfio_device *vdev,
 	int *eventfds;
 	struct vfio_pci_device *pdev = &vdev->pci;
 	struct vfio_pci_msi_common *msis = msix ? &pdev->msix : &pdev->msi;
-	struct vfio_irq_eventfd single = {
+	union vfio_irq_eventfd single = {
 		.irq = {
 			.argsz	= sizeof(single),
 			.flags	= VFIO_IRQ_SET_DATA_EVENTFD |
@@ -50,17 +60,14 @@ static int vfio_pci_enable_msis(struct kvm *kvm, struct vfio_device *vdev,
 	if (!msi_is_enabled(msis->virt_state))
 		return 0;
 
-	if (pdev->irq_modes & VFIO_PCI_IRQ_MODE_INTX) {
+	if (pdev->irq_modes & VFIO_PCI_IRQ_MODE_INTX)
 		/*
 		 * PCI (and VFIO) forbids enabling INTx, MSI or MSIX at the same
 		 * time. Since INTx has to be enabled from the start (we don't
-		 * have a reliable way to know when the user starts using it),
+		 * have a reliable way to know when the guest starts using it),
 		 * disable it now.
 		 */
 		vfio_pci_disable_intx(kvm, vdev);
-		/* Permanently disable INTx */
-		pdev->irq_modes &= ~VFIO_PCI_IRQ_MODE_INTX;
-	}
 
 	eventfds = (void *)msis->irq_set + sizeof(struct vfio_irq_set);
 
@@ -119,7 +126,7 @@ static int vfio_pci_enable_msis(struct kvm *kvm, struct vfio_device *vdev,
 			continue;
 
 		single.irq.start = i;
-		single.fd = fd;
+		set_vfio_irq_eventd_payload(&single, fd);
 
 		ret = ioctl(vdev->fd, VFIO_DEVICE_SET_IRQS, &single);
 		if (ret < 0) {
@@ -162,7 +169,16 @@ static int vfio_pci_disable_msis(struct kvm *kvm, struct vfio_device *vdev,
 	msi_set_enabled(msis->phys_state, false);
 	msi_set_empty(msis->phys_state, true);
 
-	return 0;
+	/*
+	 * When MSI or MSIX is disabled, this might be called when
+	 * PCI driver detects the MSI interrupt failure and wants to
+	 * rollback to INTx mode.  Thus enable INTx if the device
+	 * supports INTx mode in this case.
+	 */
+	if (pdev->irq_modes & VFIO_PCI_IRQ_MODE_INTX)
+		ret = vfio_pci_enable_intx(kvm, vdev);
+
+	return ret >= 0 ? 0 : ret;
 }
 
 static int vfio_pci_update_msi_entry(struct kvm *kvm, struct vfio_device *vdev,
@@ -422,6 +438,14 @@ static void vfio_pci_msi_cap_write(struct kvm *kvm, struct vfio_device *vdev,
 
 	for (i = 0; i < nr_vectors; i++) {
 		entry = &pdev->msi.entries[i];
+
+		/*
+		 * Set the MSI data value as required by the PCI local
+		 * bus specifications, MSI capability, "Message Data".
+		 */
+		msg.data &= ~(nr_vectors - 1);
+		msg.data |= i;
+
 		entry->config.msg = msg;
 		vfio_pci_update_msi_entry(kvm, vdev, entry);
 	}
@@ -432,6 +456,100 @@ static void vfio_pci_msi_cap_write(struct kvm *kvm, struct vfio_device *vdev,
 
 out_unlock:
 	mutex_unlock(&pdev->msi.mutex);
+}
+
+static int vfio_pci_bar_activate(struct kvm *kvm,
+				 struct pci_device_header *pci_hdr,
+				 int bar_num, void *data)
+{
+	struct vfio_device *vdev = data;
+	struct vfio_pci_device *pdev = &vdev->pci;
+	struct vfio_pci_msix_pba *pba = &pdev->msix_pba;
+	struct vfio_pci_msix_table *table = &pdev->msix_table;
+	struct vfio_region *region;
+	u32 bar_addr;
+	bool has_msix;
+	int ret;
+
+	assert((u32)bar_num < vdev->info.num_regions);
+
+	region = &vdev->regions[bar_num];
+	has_msix = pdev->irq_modes & VFIO_PCI_IRQ_MODE_MSIX;
+
+	bar_addr = pci__bar_address(pci_hdr, bar_num);
+	if (pci__bar_is_io(pci_hdr, bar_num))
+		region->port_base = bar_addr;
+	else
+		region->guest_phys_addr = bar_addr;
+
+	if (has_msix && (u32)bar_num == table->bar) {
+		table->guest_phys_addr = region->guest_phys_addr;
+		ret = kvm__register_mmio(kvm, table->guest_phys_addr,
+					 table->size, false,
+					 vfio_pci_msix_table_access, pdev);
+		/*
+		 * The MSIX table and the PBA structure can share the same BAR,
+		 * but for convenience we register different regions for mmio
+		 * emulation. We want to we update both if they share the same
+		 * BAR.
+		 */
+		if (ret < 0 || table->bar != pba->bar)
+			goto out;
+	}
+
+	if (has_msix && (u32)bar_num == pba->bar) {
+		if (pba->bar == table->bar)
+			pba->guest_phys_addr = table->guest_phys_addr + table->size;
+		else
+			pba->guest_phys_addr = region->guest_phys_addr;
+		ret = kvm__register_mmio(kvm, pba->guest_phys_addr,
+					 pba->size, false,
+					 vfio_pci_msix_pba_access, pdev);
+		goto out;
+	}
+
+	ret = vfio_map_region(kvm, vdev, region);
+out:
+	return ret;
+}
+
+static int vfio_pci_bar_deactivate(struct kvm *kvm,
+				   struct pci_device_header *pci_hdr,
+				   int bar_num, void *data)
+{
+	struct vfio_device *vdev = data;
+	struct vfio_pci_device *pdev = &vdev->pci;
+	struct vfio_pci_msix_pba *pba = &pdev->msix_pba;
+	struct vfio_pci_msix_table *table = &pdev->msix_table;
+	struct vfio_region *region;
+	bool has_msix, success;
+	int ret;
+
+	assert((u32)bar_num < vdev->info.num_regions);
+
+	region = &vdev->regions[bar_num];
+	has_msix = pdev->irq_modes & VFIO_PCI_IRQ_MODE_MSIX;
+
+	if (has_msix && (u32)bar_num == table->bar) {
+		success = kvm__deregister_mmio(kvm, table->guest_phys_addr);
+		/* kvm__deregister_mmio fails when the region is not found. */
+		ret = (success ? 0 : -ENOENT);
+		/* See vfio_pci_bar_activate(). */
+		if (ret < 0 || table->bar!= pba->bar)
+			goto out;
+	}
+
+	if (has_msix && (u32)bar_num == pba->bar) {
+		success = kvm__deregister_mmio(kvm, pba->guest_phys_addr);
+		ret = (success ? 0 : -ENOENT);
+		goto out;
+	}
+
+	vfio_unmap_region(kvm, region);
+	ret = 0;
+
+out:
+	return ret;
 }
 
 static void vfio_pci_cfg_read(struct kvm *kvm, struct pci_device_header *pci_hdr,
@@ -458,7 +576,13 @@ static void vfio_pci_cfg_write(struct kvm *kvm, struct pci_device_header *pci_hd
 	struct vfio_region_info *info;
 	struct vfio_pci_device *pdev;
 	struct vfio_device *vdev;
-	void *base = pci_hdr;
+	u32 tmp;
+
+	/* Make sure a larger size will not overrun tmp on the stack. */
+	assert(sz <= 4);
+
+	if (offset == PCI_ROM_ADDRESS)
+		return;
 
 	pdev = container_of(pci_hdr, struct vfio_pci_device, hdr);
 	vdev = container_of(pdev, struct vfio_device, pci);
@@ -475,7 +599,7 @@ static void vfio_pci_cfg_write(struct kvm *kvm, struct pci_device_header *pci_hd
 	if (pdev->irq_modes & VFIO_PCI_IRQ_MODE_MSI)
 		vfio_pci_msi_cap_write(kvm, vdev, offset, data, sz);
 
-	if (pread(vdev->fd, base + offset, sz, info->offset + offset) != sz)
+	if (pread(vdev->fd, &tmp, sz, info->offset + offset) != sz)
 		vfio_dev_warn(vdev, "Failed to read %d bytes from Configuration Space at 0x%x",
 			      sz, offset);
 }
@@ -550,11 +674,6 @@ static int vfio_pci_parse_caps(struct vfio_device *vdev)
 	pdev->hdr.capabilities = 0;
 
 	for (; pos; pos = next) {
-		if (pos >= PCI_DEV_CFG_SIZE) {
-			vfio_dev_warn(vdev, "ignoring cap outside of config space");
-			return -EINVAL;
-		}
-
 		cap = PCI_CAP(&pdev->hdr, pos);
 		next = cap->next;
 
@@ -635,16 +754,19 @@ static int vfio_pci_parse_cfg_space(struct vfio_device *vdev)
 static int vfio_pci_fixup_cfg_space(struct vfio_device *vdev)
 {
 	int i;
+	u64 base;
 	ssize_t hdr_sz;
 	struct msix_cap *msix;
 	struct vfio_region_info *info;
 	struct vfio_pci_device *pdev = &vdev->pci;
+	struct vfio_region *region;
 
 	/* Initialise the BARs */
 	for (i = VFIO_PCI_BAR0_REGION_INDEX; i <= VFIO_PCI_BAR5_REGION_INDEX; ++i) {
-		u64 base;
-		struct vfio_region *region = &vdev->regions[i];
+		if ((u32)i == vdev->info.num_regions)
+			break;
 
+		region = &vdev->regions[i];
 		/* Construct a fake reg to match what we've mapped. */
 		if (region->is_ioport) {
 			base = (region->port_base & PCI_BASE_ADDRESS_IO_MASK) |
@@ -708,17 +830,44 @@ static int vfio_pci_fixup_cfg_space(struct vfio_device *vdev)
 	return 0;
 }
 
-static int vfio_pci_create_msix_table(struct kvm *kvm,
-				      struct vfio_pci_device *pdev)
+static int vfio_pci_get_region_info(struct vfio_device *vdev, u32 index,
+				    struct vfio_region_info *info)
+{
+	int ret;
+
+	*info = (struct vfio_region_info) {
+		.argsz = sizeof(*info),
+		.index = index,
+	};
+
+	ret = ioctl(vdev->fd, VFIO_DEVICE_GET_REGION_INFO, info);
+	if (ret) {
+		ret = -errno;
+		vfio_dev_err(vdev, "cannot get info for BAR %u", index);
+		return ret;
+	}
+
+	if (info->size && !is_power_of_two(info->size)) {
+		vfio_dev_err(vdev, "region is not power of two: 0x%llx",
+				info->size);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int vfio_pci_create_msix_table(struct kvm *kvm, struct vfio_device *vdev)
 {
 	int ret;
 	size_t i;
-	size_t mmio_size;
+	size_t map_size;
 	size_t nr_entries;
 	struct vfio_pci_msi_entry *entries;
+	struct vfio_pci_device *pdev = &vdev->pci;
 	struct vfio_pci_msix_pba *pba = &pdev->msix_pba;
 	struct vfio_pci_msix_table *table = &pdev->msix_table;
 	struct msix_cap *msix = PCI_CAP(&pdev->hdr, pdev->msix.pos);
+	struct vfio_region_info info;
 
 	table->bar = msix->table_offset & PCI_MSIX_TABLE_BIR;
 	pba->bar = msix->pba_offset & PCI_MSIX_TABLE_BIR;
@@ -737,24 +886,34 @@ static int vfio_pci_create_msix_table(struct kvm *kvm,
 	for (i = 0; i < nr_entries; i++)
 		entries[i].config.ctrl = PCI_MSIX_ENTRY_CTRL_MASKBIT;
 
+	ret = vfio_pci_get_region_info(vdev, table->bar, &info);
+	if (ret)
+		return ret;
+	if (!info.size)
+		return -EINVAL;
+	map_size = info.size;
+
+	if (table->bar != pba->bar) {
+		ret = vfio_pci_get_region_info(vdev, pba->bar, &info);
+		if (ret)
+			return ret;
+		if (!info.size)
+			return -EINVAL;
+		map_size += info.size;
+	}
+
 	/*
 	 * To ease MSI-X cap configuration in case they share the same BAR,
 	 * collapse table and pending array. The size of the BAR regions must be
 	 * powers of two.
 	 */
-	mmio_size = roundup_pow_of_two(table->size + pba->size);
-	table->guest_phys_addr = pci_get_io_space_block(mmio_size);
+	map_size = ALIGN(map_size, PAGE_SIZE);
+	table->guest_phys_addr = pci_get_mmio_block(map_size);
 	if (!table->guest_phys_addr) {
-		pr_err("cannot allocate IO space");
+		pr_err("cannot allocate MMIO space");
 		ret = -ENOMEM;
 		goto out_free;
 	}
-	pba->guest_phys_addr = table->guest_phys_addr + table->size;
-
-	ret = kvm__register_mmio(kvm, table->guest_phys_addr, table->size,
-				 false, vfio_pci_msix_table_access, pdev);
-	if (ret < 0)
-		goto out_free;
 
 	/*
 	 * We could map the physical PBA directly into the guest, but it's
@@ -764,10 +923,7 @@ static int vfio_pci_create_msix_table(struct kvm *kvm,
 	 * between MSI-X table and PBA. For the sake of isolation, create a
 	 * virtual PBA.
 	 */
-	ret = kvm__register_mmio(kvm, pba->guest_phys_addr, pba->size, false,
-				 vfio_pci_msix_pba_access, pdev);
-	if (ret < 0)
-		goto out_free;
+	pba->guest_phys_addr = table->guest_phys_addr + table->size;
 
 	pdev->msix.entries = entries;
 	pdev->msix.nr_entries = nr_entries;
@@ -800,26 +956,20 @@ static int vfio_pci_configure_bar(struct kvm *kvm, struct vfio_device *vdev,
 	u32 bar;
 	size_t map_size;
 	struct vfio_pci_device *pdev = &vdev->pci;
-	struct vfio_region *region = &vdev->regions[nr];
+	struct vfio_region *region;
 
 	if (nr >= vdev->info.num_regions)
 		return 0;
 
+	region = &vdev->regions[nr];
 	bar = pdev->hdr.bar[nr];
 
 	region->vdev = vdev;
 	region->is_ioport = !!(bar & PCI_BASE_ADDRESS_SPACE_IO);
-	region->info = (struct vfio_region_info) {
-		.argsz = sizeof(region->info),
-		.index = nr,
-	};
 
-	ret = ioctl(vdev->fd, VFIO_DEVICE_GET_REGION_INFO, &region->info);
-	if (ret) {
-		ret = -errno;
-		vfio_dev_err(vdev, "cannot get info for BAR %zu", nr);
+	ret = vfio_pci_get_region_info(vdev, nr, &region->info);
+	if (ret)
 		return ret;
-	}
 
 	/* Ignore invalid or unimplemented regions */
 	if (!region->info.size)
@@ -836,16 +986,13 @@ static int vfio_pci_configure_bar(struct kvm *kvm, struct vfio_device *vdev,
 		}
 	}
 
-	if (!region->is_ioport) {
+	if (region->is_ioport) {
+		region->port_base = pci_get_io_port_block(region->info.size);
+	} else {
 		/* Grab some MMIO space in the guest */
 		map_size = ALIGN(region->info.size, PAGE_SIZE);
-		region->guest_phys_addr = pci_get_io_space_block(map_size);
+		region->guest_phys_addr = pci_get_mmio_block(map_size);
 	}
-
-	/* Map the BARs into the guest or setup a trap region. */
-	ret = vfio_map_region(kvm, vdev, region);
-	if (ret)
-		return ret;
 
 	return 0;
 }
@@ -864,7 +1011,7 @@ static int vfio_pci_configure_dev_regions(struct kvm *kvm,
 		return ret;
 
 	if (pdev->irq_modes & VFIO_PCI_IRQ_MODE_MSIX) {
-		ret = vfio_pci_create_msix_table(kvm, pdev);
+		ret = vfio_pci_create_msix_table(kvm, vdev);
 		if (ret)
 			return ret;
 	}
@@ -877,8 +1024,10 @@ static int vfio_pci_configure_dev_regions(struct kvm *kvm,
 
 	for (i = VFIO_PCI_BAR0_REGION_INDEX; i <= VFIO_PCI_BAR5_REGION_INDEX; ++i) {
 		/* Ignore top half of 64-bit BAR */
-		if (i % 2 && is_64bit)
+		if (is_64bit) {
+			is_64bit = false;
 			continue;
+		}
 
 		ret = vfio_pci_configure_bar(kvm, vdev, i);
 		if (ret)
@@ -891,7 +1040,12 @@ static int vfio_pci_configure_dev_regions(struct kvm *kvm,
 	}
 
 	/* We've configured the BARs, fake up a Configuration Space */
-	return vfio_pci_fixup_cfg_space(vdev);
+	ret = vfio_pci_fixup_cfg_space(vdev);
+	if (ret)
+		return ret;
+
+	return pci__register_bar_regions(kvm, &pdev->hdr, vfio_pci_bar_activate,
+					 vfio_pci_bar_deactivate, vdev);
 }
 
 /*
@@ -945,7 +1099,7 @@ static int vfio_pci_init_msis(struct kvm *kvm, struct vfio_device *vdev,
 	size_t nr_entries = msis->nr_entries;
 
 	ret = ioctl(vdev->fd, VFIO_DEVICE_GET_IRQ_INFO, &msis->info);
-	if (ret || &msis->info.count == 0) {
+	if (ret || msis->info.count == 0) {
 		vfio_dev_err(vdev, "no MSI reported by VFIO");
 		return -ENODEV;
 	}
@@ -1002,45 +1156,30 @@ static void vfio_pci_disable_intx(struct kvm *kvm, struct vfio_device *vdev)
 		.index	= VFIO_PCI_INTX_IRQ_INDEX,
 	};
 
+	if (pdev->intx_fd == -1)
+		return;
+
 	pr_debug("user requested MSI, disabling INTx %d", gsi);
 
 	ioctl(vdev->fd, VFIO_DEVICE_SET_IRQS, &irq_set);
 	irq__del_irqfd(kvm, gsi, pdev->intx_fd);
 
 	close(pdev->intx_fd);
+	close(pdev->unmask_fd);
+	pdev->intx_fd = -1;
 }
 
 static int vfio_pci_enable_intx(struct kvm *kvm, struct vfio_device *vdev)
 {
 	int ret;
 	int trigger_fd, unmask_fd;
-	struct vfio_irq_eventfd	trigger;
-	struct vfio_irq_eventfd	unmask;
+	union vfio_irq_eventfd	trigger;
+	union vfio_irq_eventfd	unmask;
 	struct vfio_pci_device *pdev = &vdev->pci;
-	int gsi = pdev->hdr.irq_line - KVM_IRQ_OFFSET;
+	int gsi = pdev->intx_gsi;
 
-	struct vfio_irq_info irq_info = {
-		.argsz = sizeof(irq_info),
-		.index = VFIO_PCI_INTX_IRQ_INDEX,
-	};
-
-	vfio_pci_reserve_irq_fds(2);
-
-	ret = ioctl(vdev->fd, VFIO_DEVICE_GET_IRQ_INFO, &irq_info);
-	if (ret || irq_info.count == 0) {
-		vfio_dev_err(vdev, "no INTx reported by VFIO");
-		return -ENODEV;
-	}
-
-	if (!(irq_info.flags & VFIO_IRQ_INFO_EVENTFD)) {
-		vfio_dev_err(vdev, "interrupt not eventfd capable");
-		return -EINVAL;
-	}
-
-	if (!(irq_info.flags & VFIO_IRQ_INFO_AUTOMASKED)) {
-		vfio_dev_err(vdev, "INTx interrupt not AUTOMASKED");
-		return -EINVAL;
-	}
+	if (pdev->intx_fd != -1)
+		return 0;
 
 	/*
 	 * PCI IRQ is level-triggered, so we use two eventfds. trigger_fd
@@ -1071,7 +1210,7 @@ static int vfio_pci_enable_intx(struct kvm *kvm, struct vfio_device *vdev)
 		.start	= 0,
 		.count	= 1,
 	};
-	trigger.fd = trigger_fd;
+	set_vfio_irq_eventd_payload(&trigger, trigger_fd);
 
 	ret = ioctl(vdev->fd, VFIO_DEVICE_SET_IRQS, &trigger);
 	if (ret < 0) {
@@ -1086,7 +1225,7 @@ static int vfio_pci_enable_intx(struct kvm *kvm, struct vfio_device *vdev)
 		.start	= 0,
 		.count	= 1,
 	};
-	unmask.fd = unmask_fd;
+	set_vfio_irq_eventd_payload(&unmask, unmask_fd);
 
 	ret = ioctl(vdev->fd, VFIO_DEVICE_SET_IRQS, &unmask);
 	if (ret < 0) {
@@ -1095,8 +1234,7 @@ static int vfio_pci_enable_intx(struct kvm *kvm, struct vfio_device *vdev)
 	}
 
 	pdev->intx_fd = trigger_fd;
-	/* Guest is going to ovewrite our irq_line... */
-	pdev->intx_gsi = gsi;
+	pdev->unmask_fd = unmask_fd;
 
 	return 0;
 
@@ -1113,6 +1251,41 @@ err_close:
 	close(trigger_fd);
 	close(unmask_fd);
 	return ret;
+}
+
+static int vfio_pci_init_intx(struct kvm *kvm, struct vfio_device *vdev)
+{
+	int ret;
+	struct vfio_pci_device *pdev = &vdev->pci;
+	struct vfio_irq_info irq_info = {
+		.argsz = sizeof(irq_info),
+		.index = VFIO_PCI_INTX_IRQ_INDEX,
+	};
+
+	vfio_pci_reserve_irq_fds(2);
+
+	ret = ioctl(vdev->fd, VFIO_DEVICE_GET_IRQ_INFO, &irq_info);
+	if (ret || irq_info.count == 0) {
+		vfio_dev_err(vdev, "no INTx reported by VFIO");
+		return -ENODEV;
+	}
+
+	if (!(irq_info.flags & VFIO_IRQ_INFO_EVENTFD)) {
+		vfio_dev_err(vdev, "interrupt not eventfd capable");
+		return -EINVAL;
+	}
+
+	if (!(irq_info.flags & VFIO_IRQ_INFO_AUTOMASKED)) {
+		vfio_dev_err(vdev, "INTx interrupt not AUTOMASKED");
+		return -EINVAL;
+	}
+
+	/* Guest is going to ovewrite our irq_line... */
+	pdev->intx_gsi = pdev->hdr.irq_line - KVM_IRQ_OFFSET;
+
+	pdev->intx_fd = -1;
+
+	return 0;
 }
 
 static int vfio_pci_configure_dev_irqs(struct kvm *kvm, struct vfio_device *vdev)
@@ -1140,8 +1313,15 @@ static int vfio_pci_configure_dev_irqs(struct kvm *kvm, struct vfio_device *vdev
 			return ret;
 	}
 
-	if (pdev->irq_modes & VFIO_PCI_IRQ_MODE_INTX)
+	if (pdev->irq_modes & VFIO_PCI_IRQ_MODE_INTX) {
+		pci__assign_irq(&vdev->pci.hdr);
+
+		ret = vfio_pci_init_intx(kvm, vdev);
+		if (ret)
+			return ret;
+
 		ret = vfio_pci_enable_intx(kvm, vdev);
+	}
 
 	return ret;
 }

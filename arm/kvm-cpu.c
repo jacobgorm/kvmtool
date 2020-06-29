@@ -68,6 +68,8 @@ struct kvm_cpu *kvm_cpu__arch_init(struct kvm *kvm, unsigned long cpu_id)
 		vcpu_init.features[0] |= (1UL << KVM_ARM_VCPU_PSCI_0_2);
 	}
 
+	kvm_cpu__select_features(kvm, &vcpu_init);
+
 	/*
 	 * If the preferred target ioctl is successful then
 	 * use preferred target else try each and every target type
@@ -121,6 +123,9 @@ struct kvm_cpu *kvm_cpu__arch_init(struct kvm *kvm, unsigned long cpu_id)
 	vcpu->cpu_type		= vcpu_init.target;
 	vcpu->cpu_compatible	= target->compatible;
 	vcpu->is_running	= true;
+
+	if (kvm_cpu__configure_features(vcpu))
+		die("Unable to configure requested vcpu features");
 
 	return vcpu;
 }

@@ -148,17 +148,19 @@ static u8 *get_config(struct kvm *kvm, void *dev)
 
 static u32 get_host_features(struct kvm *kvm, void *dev)
 {
+	struct blk_dev *bdev = dev;
+
 	return	1UL << VIRTIO_BLK_F_SEG_MAX
 		| 1UL << VIRTIO_BLK_F_FLUSH
 		| 1UL << VIRTIO_RING_F_EVENT_IDX
-		| 1UL << VIRTIO_RING_F_INDIRECT_DESC;
+		| 1UL << VIRTIO_RING_F_INDIRECT_DESC
+		| (bdev->disk->readonly ? 1UL << VIRTIO_BLK_F_RO : 0);
 }
 
 static void set_guest_features(struct kvm *kvm, void *dev, u32 features)
 {
 	struct blk_dev *bdev = dev;
 	struct virtio_blk_config *conf = &bdev->blk_config;
-	struct virtio_blk_geometry *geo = &conf->geometry;
 
 	bdev->features = features;
 
@@ -167,7 +169,8 @@ static void set_guest_features(struct kvm *kvm, void *dev, u32 features)
 	conf->seg_max = virtio_host_to_guest_u32(&bdev->vdev, conf->seg_max);
 
 	/* Geometry */
-	geo->cylinders = virtio_host_to_guest_u16(&bdev->vdev, geo->cylinders);
+	conf->geometry.cylinders = virtio_host_to_guest_u16(&bdev->vdev,
+						conf->geometry.cylinders);
 
 	conf->blk_size = virtio_host_to_guest_u32(&bdev->vdev, conf->blk_size);
 	conf->min_io_size = virtio_host_to_guest_u16(&bdev->vdev, conf->min_io_size);
@@ -245,6 +248,8 @@ static void exit_vq(struct kvm *kvm, void *dev, u32 vq)
 	close(bdev->io_efd);
 	pthread_cancel(bdev->io_thread);
 	pthread_join(bdev->io_thread, NULL);
+
+	disk_image__wait(bdev->disk);
 }
 
 static int notify_vq(struct kvm *kvm, void *dev, u32 vq)
@@ -301,6 +306,7 @@ static struct virtio_ops blk_dev_virtio_ops = {
 static int virtio_blk__init_one(struct kvm *kvm, struct disk_image *disk)
 {
 	struct blk_dev *bdev;
+	int r;
 
 	if (!disk)
 		return -EINVAL;
@@ -318,11 +324,13 @@ static int virtio_blk__init_one(struct kvm *kvm, struct disk_image *disk)
 		.kvm			= kvm,
 	};
 
-	virtio_init(kvm, bdev, &bdev->vdev, &blk_dev_virtio_ops,
-		    VIRTIO_DEFAULT_TRANS(kvm), PCI_DEVICE_ID_VIRTIO_BLK,
-		    VIRTIO_ID_BLOCK, PCI_CLASS_BLK);
-
 	list_add_tail(&bdev->list, &bdevs);
+
+	r = virtio_init(kvm, bdev, &bdev->vdev, &blk_dev_virtio_ops,
+			VIRTIO_DEFAULT_TRANS(kvm), PCI_DEVICE_ID_VIRTIO_BLK,
+			VIRTIO_ID_BLOCK, PCI_CLASS_BLK);
+	if (r < 0)
+		return r;
 
 	disk_image__set_callback(bdev->disk, virtio_blk_complete);
 
@@ -354,7 +362,8 @@ int virtio_blk__init(struct kvm *kvm)
 
 	return 0;
 cleanup:
-	return virtio_blk__exit(kvm);
+	virtio_blk__exit(kvm);
+	return r;
 }
 virtio_dev_init(virtio_blk__init);
 

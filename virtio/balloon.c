@@ -212,6 +212,7 @@ static int init_vq(struct kvm *kvm, void *dev, u32 vq, u32 page_size, u32 align,
 
 	thread_pool__init_job(&bdev->jobs[vq], kvm, virtio_bln_do_io, queue);
 	vring_init(&queue->vring, VIRTIO_BLN_QUEUE_SIZE, p, align);
+	virtio_init_device_vq(&bdev->vdev, queue);
 
 	return 0;
 }
@@ -263,6 +264,8 @@ struct virtio_ops bln_dev_virtio_ops = {
 
 int virtio_bln__init(struct kvm *kvm)
 {
+	int r;
+
 	if (!kvm->cfg.balloon)
 		return 0;
 
@@ -272,9 +275,11 @@ int virtio_bln__init(struct kvm *kvm)
 	bdev.stat_waitfd	= eventfd(0, 0);
 	memset(&bdev.config, 0, sizeof(struct virtio_balloon_config));
 
-	virtio_init(kvm, &bdev, &bdev.vdev, &bln_dev_virtio_ops,
-		    VIRTIO_DEFAULT_TRANS(kvm), PCI_DEVICE_ID_VIRTIO_BLN,
-		    VIRTIO_ID_BALLOON, PCI_CLASS_BLN);
+	r = virtio_init(kvm, &bdev, &bdev.vdev, &bln_dev_virtio_ops,
+			VIRTIO_DEFAULT_TRANS(kvm), PCI_DEVICE_ID_VIRTIO_BLN,
+			VIRTIO_ID_BALLOON, PCI_CLASS_BLN);
+	if (r < 0)
+		return r;
 
 	if (compat_id == -1)
 		compat_id = virtio_compat_add_message("virtio-balloon", "CONFIG_VIRTIO_BALLOON");
