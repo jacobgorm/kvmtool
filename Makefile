@@ -343,7 +343,7 @@ endif
 LIBS	+= -lrt
 LIBS	+= -lpthread
 LIBS	+= -lutil
-LIBS    += -L/home/jacob/dev/oneroot/build -lswap -lb2 -lpthread -llz4 -luuid -lcurl -lcrypto
+LIBS    += -L/home/jacob/dev/mindcastle.io/build -lswap -lb2 -lpthread -llz4 -luuid -lcurl -lcrypto
 
 comma = ,
 
@@ -358,7 +358,7 @@ DEFINES	+= -D_GNU_SOURCE
 DEFINES	+= -DKVMTOOLS_VERSION='"$(KVMTOOLS_VERSION)"'
 DEFINES	+= -DBUILD_ARCH='"$(ARCH)"'
 
-KVM_INCLUDE := include -I/home/jacob/dev/oneroot
+KVM_INCLUDE := include -I/home/jacob/dev/mindcastle.io
 CFLAGS	+= $(CPPFLAGS) $(DEFINES) -I$(KVM_INCLUDE) -I$(ARCH_INCLUDE) -O2 -fno-strict-aliasing -g
 
 WARNINGS += -Wall
