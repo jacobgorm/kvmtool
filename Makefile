@@ -343,7 +343,7 @@ endif
 LIBS	+= -lrt
 LIBS	+= -lpthread
 LIBS	+= -lutil
-LIBS    += -L/home/jacob/dev/mindcastle.io/build -lswap -lb2 -lpthread -llz4 -luuid -lcurl -lcrypto
+LIBS    += -L/home/jacob/dev/mindcastle.io/build -lswap -lpthread -llz4 -luuid -lcurl -lcrypto
 
 comma = ,
 
